@@ -31,11 +31,13 @@ public:
 
         // Connect signals
         connect(landingPage->card2D, &OptionCard::clicked, this, [this]() {
+            fractal2DPage->resetState();
             stackedWidget->setCurrentWidget(fractal2DPage);
             fractal2DPage->setFocus();
         });
 
         connect(landingPage->card3D, &OptionCard::clicked, this, [this]() {
+            fractal3DPage->resetState();
             stackedWidget->setCurrentWidget(fractal3DPage);
             fractal3DPage->setFocus();
         });

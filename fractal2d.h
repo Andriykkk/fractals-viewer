@@ -149,18 +149,26 @@ public:
 
         layout->addSpacing(20);
 
-        // Frame info section
-        auto *infoLabel = new QLabel("Frame Info:");
+        // Info section
+        auto *infoLabel = new QLabel("Info:");
         infoLabel->setStyleSheet("font-weight: bold;");
         layout->addWidget(infoLabel);
 
         frameInfoText = new QLabel();
         frameInfoText->setStyleSheet("font-size: 11px; color: #000000;");
         frameInfoText->setWordWrap(true);
-        frameInfoText->setText("FPS: --\nZoom: --\nPosition: --");
+        frameInfoText->setText("X: 0.00\nY: 0.00\nScale: 1.00x");
         layout->addWidget(frameInfoText);
 
         layout->addStretch();
+    }
+
+    void updateInfo(double x, double y, double scale)
+    {
+        frameInfoText->setText(QString("X: %1\nY: %2\nScale: %3x")
+            .arg(x, 0, 'f', 2)
+            .arg(y, 0, 'f', 2)
+            .arg(scale, 0, 'f', scale < 10 ? 2 : 0));
     }
 
     void showError(const QString &message)
@@ -219,17 +227,7 @@ public:
 
         // Connect Clear button
         connect(sidebar->btnClear, &QPushButton::clicked, this, [this]() {
-            state->formula.clear();
-            state->posX = 0.0;
-            state->posY = 0.0;
-            state->scale = 1.0;
-            state->speed = 1;
-            state->scaleSlider = 0;
-            sidebar->formulaInput->clear();
-            sidebar->speedSlider->setValue(1);
-            sidebar->scaleSlider->setValue(0);
-            sidebar->hideError();
-            glWidget->update();
+            resetState();
         });
 
         // Connect sliders
@@ -240,6 +238,7 @@ public:
         connect(sidebar->scaleSlider, &QSlider::valueChanged, this, [this](int value) {
             state->scaleSlider = value;
             state->scale = sliderToScale(value);
+            sidebar->updateInfo(state->posX, state->posY, state->scale);
             glWidget->update();
         });
 
@@ -252,6 +251,17 @@ public:
     ~FractalPage2D()
     {
         delete state;
+    }
+
+    void resetState()
+    {
+        state->clear();
+        sidebar->formulaInput->clear();
+        sidebar->speedSlider->setValue(1);
+        sidebar->scaleSlider->setValue(0);
+        sidebar->hideError();
+        sidebar->updateInfo(state->posX, state->posY, state->scale);
+        glWidget->update();
     }
 
 protected:
@@ -278,6 +288,7 @@ protected:
         }
 
         if (moved) {
+            sidebar->updateInfo(state->posX, state->posY, state->scale);
             glWidget->update();
         }
     }

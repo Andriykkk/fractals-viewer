@@ -18,6 +18,21 @@ struct FractalState
     bool moveDown = false;
     bool moveLeft = false;
     bool moveRight = false;
+
+    void clear()
+    {
+        formula.clear();
+        posX = 0.0;
+        posY = 0.0;
+        posZ = 0.0;
+        scale = 1.0;
+        speed = 1;
+        scaleSlider = 0;
+        moveUp = false;
+        moveDown = false;
+        moveLeft = false;
+        moveRight = false;
+    }
 };
 
 #endif // TYPES_H

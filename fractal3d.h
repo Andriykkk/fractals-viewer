@@ -269,18 +269,7 @@ public:
 
         // Connect Clear button
         connect(sidebar->btnClear, &QPushButton::clicked, this, [this]() {
-            state->formula.clear();
-            state->posX = 0.0;
-            state->posY = 0.0;
-            state->posZ = 0.0;
-            state->scale = 1.0;
-            state->speed = 1;
-            state->scaleSlider = 0;
-            sidebar->formulaInput->clear();
-            sidebar->speedSlider->setValue(1);
-            sidebar->scaleSlider->setValue(0);
-            sidebar->hideError();
-            glWidget->update();
+            resetState();
         });
 
         // Connect sliders
@@ -303,6 +292,16 @@ public:
     ~FractalPage3D()
     {
         delete state;
+    }
+
+    void resetState()
+    {
+        state->clear();
+        sidebar->formulaInput->clear();
+        sidebar->speedSlider->setValue(1);
+        sidebar->scaleSlider->setValue(0);
+        sidebar->hideError();
+        glWidget->update();
     }
 
 protected:
