@@ -13,6 +13,7 @@
 #include <QTimer>
 #include <QImage>
 #include <QPainter>
+#include <QColor>
 
 #include "types.h"
 #include "utils.h"
@@ -78,7 +79,7 @@ private:
         double zx = 0.0;
         double zy = 0.0;
         int iterations = 0;
-        const int maxIterations = 255;
+        int maxIterations = state->maxIterations;
 
         while (iterations < maxIterations)
         {
@@ -96,8 +97,16 @@ private:
             iterations++;
         }
 
-        // Return grayscale based on iteration count
-        return qRgb(iterations, iterations, iterations);
+        // Black for points inside the set (reached max iterations)
+        if (iterations == maxIterations)
+        {
+            return qRgb(0, 0, 0);
+        }
+
+        // HSV color based on iteration count
+        int hue = (state->hueStart + iterations * state->hueRange / maxIterations) % 360;
+        QColor color = QColor::fromHsv(hue, 255, 255);
+        return color.rgb();
     }
 
 protected:
@@ -129,7 +138,8 @@ class Sidebar2D : public QFrame
     Q_OBJECT
 
 public:
-    explicit Sidebar2D(QWidget *parent = nullptr) : QFrame(parent)
+    explicit Sidebar2D(FractalState *sharedState, QWidget *parent = nullptr)
+        : QFrame(parent), state(sharedState)
     {
         setFrameStyle(QFrame::StyledPanel);
         setFixedWidth(250);
@@ -169,13 +179,13 @@ public:
         layout->addSpacing(20);
 
         // Speed slider
-        auto *speedLabel = new QLabel("Speed: 1");
+        auto *speedLabel = new QLabel(QString("Speed: %1").arg(state->speed));
         speedLabel->setStyleSheet("font-weight: bold;");
         layout->addWidget(speedLabel);
 
         speedSlider = new QSlider(Qt::Horizontal);
         speedSlider->setRange(0, 100);
-        speedSlider->setValue(1);
+        speedSlider->setValue(state->speed);
         layout->addWidget(speedSlider);
 
         connect(speedSlider, &QSlider::valueChanged, this, [speedLabel](int value) {
@@ -183,17 +193,61 @@ public:
         });
 
         // Scale speed slider
-        auto *scaleSpeedLabel = new QLabel("Scale Speed: 0");
+        auto *scaleSpeedLabel = new QLabel(QString("Scale Speed: %1").arg(state->scaleSpeed));
         scaleSpeedLabel->setStyleSheet("font-weight: bold;");
         layout->addWidget(scaleSpeedLabel);
 
         scaleSpeedSlider = new QSlider(Qt::Horizontal);
         scaleSpeedSlider->setRange(-1000, 1000);
-        scaleSpeedSlider->setValue(0);
+        scaleSpeedSlider->setValue(state->scaleSpeed);
         layout->addWidget(scaleSpeedSlider);
 
         connect(scaleSpeedSlider, &QSlider::valueChanged, this, [scaleSpeedLabel](int value) {
             scaleSpeedLabel->setText(QString("Scale Speed: %1").arg(value));
+        });
+
+        layout->addSpacing(20);
+
+        // Max iterations slider
+        auto *maxIterLabel = new QLabel(QString("Max Iterations: %1").arg(state->maxIterations));
+        maxIterLabel->setStyleSheet("font-weight: bold;");
+        layout->addWidget(maxIterLabel);
+
+        maxIterSlider = new QSlider(Qt::Horizontal);
+        maxIterSlider->setRange(5, 1000);
+        maxIterSlider->setValue(state->maxIterations);
+        layout->addWidget(maxIterSlider);
+
+        connect(maxIterSlider, &QSlider::valueChanged, this, [maxIterLabel](int value) {
+            maxIterLabel->setText(QString("Max Iterations: %1").arg(value));
+        });
+
+        // Hue range slider
+        auto *hueRangeLabel = new QLabel(QString("Hue Range: %1").arg(state->hueRange));
+        hueRangeLabel->setStyleSheet("font-weight: bold;");
+        layout->addWidget(hueRangeLabel);
+
+        hueRangeSlider = new QSlider(Qt::Horizontal);
+        hueRangeSlider->setRange(1, 360);
+        hueRangeSlider->setValue(state->hueRange);
+        layout->addWidget(hueRangeSlider);
+
+        connect(hueRangeSlider, &QSlider::valueChanged, this, [hueRangeLabel](int value) {
+            hueRangeLabel->setText(QString("Hue Range: %1").arg(value));
+        });
+
+        // Hue start slider
+        auto *hueStartLabel = new QLabel(QString("Hue Start: %1").arg(state->hueStart));
+        hueStartLabel->setStyleSheet("font-weight: bold;");
+        layout->addWidget(hueStartLabel);
+
+        hueStartSlider = new QSlider(Qt::Horizontal);
+        hueStartSlider->setRange(0, 360);
+        hueStartSlider->setValue(state->hueStart);
+        layout->addWidget(hueStartSlider);
+
+        connect(hueStartSlider, &QSlider::valueChanged, this, [hueStartLabel](int value) {
+            hueStartLabel->setText(QString("Hue Start: %1").arg(value));
         });
 
         layout->addSpacing(20);
@@ -206,7 +260,10 @@ public:
         frameInfoText = new QLabel();
         frameInfoText->setStyleSheet("font-size: 11px; color: #000000;");
         frameInfoText->setWordWrap(true);
-        frameInfoText->setText("X: 0.00\nY: 0.00\nScale: 1.00x");
+        frameInfoText->setText(QString("X: %1\nY: %2\nScale: %3x")
+            .arg(state->posX, 0, 'f', 2)
+            .arg(state->posY, 0, 'f', 2)
+            .arg(state->scale, 0, 'f', 2));
         layout->addWidget(frameInfoText);
 
         layout->addStretch();
@@ -236,6 +293,7 @@ public:
         frameInfoText->setText(info);
     }
 
+    FractalState *state;
     QPushButton *btnBack;
     QPushButton *btnUpdate;
     QPushButton *btnClear;
@@ -244,6 +302,9 @@ public:
     QLabel *frameInfoText;
     QSlider *speedSlider;
     QSlider *scaleSpeedSlider;
+    QSlider *maxIterSlider;
+    QSlider *hueRangeSlider;
+    QSlider *hueStartSlider;
 };
 
 class FractalPage2D : public QWidget
@@ -261,7 +322,7 @@ public:
         layout->setContentsMargins(0, 0, 0, 0);
         layout->setSpacing(0);
 
-        sidebar = new Sidebar2D();
+        sidebar = new Sidebar2D(state);
         layout->addWidget(sidebar);
 
         fractalWidget = new FractalWidget2D(state);
@@ -288,6 +349,21 @@ public:
             state->scaleSpeed = value;
         });
 
+        connect(sidebar->maxIterSlider, &QSlider::valueChanged, this, [this](int value) {
+            state->maxIterations = value;
+            fractalWidget->renderFractal();
+        });
+
+        connect(sidebar->hueRangeSlider, &QSlider::valueChanged, this, [this](int value) {
+            state->hueRange = value;
+            fractalWidget->renderFractal();
+        });
+
+        connect(sidebar->hueStartSlider, &QSlider::valueChanged, this, [this](int value) {
+            state->hueStart = value;
+            fractalWidget->renderFractal();
+        });
+
         // Game loop timer
         gameTimer = new QTimer(this);
         connect(gameTimer, &QTimer::timeout, this, &FractalPage2D::gameLoop);
@@ -303,8 +379,11 @@ public:
     {
         state->clear();
         sidebar->formulaInput->clear();
-        sidebar->speedSlider->setValue(1);
-        sidebar->scaleSpeedSlider->setValue(0);
+        sidebar->speedSlider->setValue(state->speed);
+        sidebar->scaleSpeedSlider->setValue(state->scaleSpeed);
+        sidebar->maxIterSlider->setValue(state->maxIterations);
+        sidebar->hueRangeSlider->setValue(state->hueRange);
+        sidebar->hueStartSlider->setValue(state->hueStart);
         sidebar->hideError();
         sidebar->updateInfo(state->posX, state->posY, state->scale);
         fractalWidget->renderFractal();

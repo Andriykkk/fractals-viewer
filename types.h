@@ -13,6 +13,12 @@ struct FractalState
     int speed = 1;             // movement speed 0 to 100
     int scaleSpeed = 0;        // scale change speed -1000 to 1000
 
+    // Color settings
+    int hueRange = 240;        // how much of HSV to use (0-360)
+    int hueStart = 0;          // starting hue position (0-360)
+
+    int maxIterations = 100;   // 5 to 1000
+
     // Movement flags
     bool moveUp = false;
     bool moveDown = false;
