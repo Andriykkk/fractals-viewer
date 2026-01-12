@@ -36,16 +36,68 @@ public:
 
         image = QImage(width(), height(), QImage::Format_RGB32);
 
-        // For now, just fill with red
-        for (int y = 0; y < height(); ++y)
+        int w = width();
+        int h = height();
+        double scale = state->scale;
+        double posX = state->posX;
+        double posY = state->posY;
+
+        for (int py = 0; py < h; ++py)
         {
-            for (int x = 0; x < width(); ++x)
+            for (int px = 0; px < w; ++px)
             {
-                image.setPixel(x, y, qRgb(255, 0, 0));
+                QRgb color = renderPixel(px, py, w, h, posX, posY, scale);
+                image.setPixel(px, py, color);
             }
         }
 
         update();
+    }
+
+private:
+    QRgb renderPixel(int px, int py, int w, int h, double posX, double posY, double scale)
+    {
+        // At scale 1, width shows range of 2 (-1 to 1)
+        // Each pixel represents (2 / scale) / w units in world space
+        double pixelSize = 2.0 / (scale * w);
+
+        // Distance from center pixel (handles both odd and even dimensions)
+        // For w=5: center is 2.0, pixels 0,1,2,3,4 have offsets -2,-1,0,1,2
+        // For w=4: center is 1.5, pixels 0,1,2,3 have offsets -1.5,-0.5,0.5,1.5
+        double centerX = (w - 1) / 2.0;
+        double centerY = (h - 1) / 2.0;
+
+        double offsetX = px - centerX;
+        double offsetY = centerY - py;  // Y is inverted (screen Y goes down)
+
+        // Map to world coordinates (this is c in the Mandelbrot formula)
+        double cx = posX + offsetX * pixelSize;
+        double cy = posY + offsetY * pixelSize;
+
+        // Mandelbrot iteration: z = z^2 + c, starting with z = 0
+        double zx = 0.0;
+        double zy = 0.0;
+        int iterations = 0;
+        const int maxIterations = 255;
+
+        while (iterations < maxIterations)
+        {
+            double zx2 = zx * zx;
+            double zy2 = zy * zy;
+
+            // Check escape condition: |z| > 2
+            if (zx2 + zy2 > 4.0) break;
+
+            // z = z^2 + c
+            double newZx = zx2 - zy2 + cx;
+            zy = 2.0 * zx * zy + cy;
+            zx = newZx;
+
+            iterations++;
+        }
+
+        // Return grayscale based on iteration count
+        return qRgb(iterations, iterations, iterations);
     }
 
 protected:
