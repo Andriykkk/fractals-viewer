@@ -3,8 +3,6 @@
 
 #include <QWidget>
 #include <QFrame>
-#include <QOpenGLWidget>
-#include <QOpenGLFunctions>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -13,65 +11,65 @@
 #include <QSlider>
 #include <QKeyEvent>
 #include <QTimer>
+#include <QImage>
+#include <QPainter>
 
 #include "types.h"
 #include "utils.h"
 
-class GLWidget2D : public QOpenGLWidget, protected QOpenGLFunctions
+class FractalWidget2D : public QWidget
 {
     Q_OBJECT
 
 public:
-    explicit GLWidget2D(FractalState *sharedState, QWidget *parent = nullptr)
-        : QOpenGLWidget(parent), state(sharedState) {}
+    explicit FractalWidget2D(FractalState *sharedState, QWidget *parent = nullptr)
+        : QWidget(parent), state(sharedState)
+    {
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    }
 
     FractalState *state;
 
-protected:
-    void initializeGL() override
+    void renderFractal()
     {
-        initializeOpenGLFunctions();
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        if (width() <= 0 || height() <= 0) return;
+
+        image = QImage(width(), height(), QImage::Format_RGB32);
+
+        // For now, just fill with red
+        for (int y = 0; y < height(); ++y)
+        {
+            for (int x = 0; x < width(); ++x)
+            {
+                image.setPixel(x, y, qRgb(255, 0, 0));
+            }
+        }
+
+        update();
     }
 
-    void resizeGL(int w, int h) override
+protected:
+    void paintEvent(QPaintEvent *) override
     {
-        glViewport(0, 0, w, h);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-
-        float aspect = (h > 0) ? static_cast<float>(w) / h : 1.0f;
-        if (aspect >= 1.0f)
+        QPainter painter(this);
+        if (!image.isNull())
         {
-            glOrtho(-aspect, aspect, -1.0, 1.0, -1.0, 1.0);
+            painter.drawImage(0, 0, image);
         }
         else
         {
-            glOrtho(-1.0, 1.0, -1.0 / aspect, 1.0 / aspect, -1.0, 1.0);
+            painter.fillRect(rect(), Qt::black);
         }
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
     }
 
-    void paintGL() override
+    void resizeEvent(QResizeEvent *event) override
     {
-        glClear(GL_COLOR_BUFFER_BIT);
-        glLoadIdentity();
-
-        // Get position from state
-        float px = static_cast<float>(state->posX);
-        float py = static_cast<float>(state->posY);
-
-        // Draw a colored triangle at current position
-        glBegin(GL_TRIANGLES);
-        glColor3f(1.0f, 0.0f, 0.0f);
-        glVertex2f(px + 0.0f, py + 0.5f);
-        glColor3f(0.0f, 1.0f, 0.0f);
-        glVertex2f(px - 0.5f, py - 0.5f);
-        glColor3f(0.0f, 0.0f, 1.0f);
-        glVertex2f(px + 0.5f, py - 0.5f);
-        glEnd();
+        QWidget::resizeEvent(event);
+        renderFractal();
     }
+
+private:
+    QImage image;
 };
 
 class Sidebar2D : public QFrame
@@ -132,19 +130,18 @@ public:
             speedLabel->setText(QString("Speed: %1").arg(value));
         });
 
-        // Scale slider
-        auto *scaleSliderLabel = new QLabel("Scale: 1.00x");
-        scaleSliderLabel->setStyleSheet("font-weight: bold;");
-        layout->addWidget(scaleSliderLabel);
+        // Scale speed slider
+        auto *scaleSpeedLabel = new QLabel("Scale Speed: 0");
+        scaleSpeedLabel->setStyleSheet("font-weight: bold;");
+        layout->addWidget(scaleSpeedLabel);
 
-        scaleSlider = new QSlider(Qt::Horizontal);
-        scaleSlider->setRange(-1000, 1000);
-        scaleSlider->setValue(0);
-        layout->addWidget(scaleSlider);
+        scaleSpeedSlider = new QSlider(Qt::Horizontal);
+        scaleSpeedSlider->setRange(-1000, 1000);
+        scaleSpeedSlider->setValue(0);
+        layout->addWidget(scaleSpeedSlider);
 
-        connect(scaleSlider, &QSlider::valueChanged, this, [scaleSliderLabel](int value) {
-            double scale = sliderToScale(value);
-            scaleSliderLabel->setText(QString("Scale: %1x").arg(scale, 0, 'f', scale < 10 ? 2 : 0));
+        connect(scaleSpeedSlider, &QSlider::valueChanged, this, [scaleSpeedLabel](int value) {
+            scaleSpeedLabel->setText(QString("Scale Speed: %1").arg(value));
         });
 
         layout->addSpacing(20);
@@ -194,7 +191,7 @@ public:
     QLabel *errorLabel;
     QLabel *frameInfoText;
     QSlider *speedSlider;
-    QSlider *scaleSlider;
+    QSlider *scaleSpeedSlider;
 };
 
 class FractalPage2D : public QWidget
@@ -215,14 +212,14 @@ public:
         sidebar = new Sidebar2D();
         layout->addWidget(sidebar);
 
-        glWidget = new GLWidget2D(state);
-        layout->addWidget(glWidget, 1);
+        fractalWidget = new FractalWidget2D(state);
+        layout->addWidget(fractalWidget, 1);
 
         // Connect Update button
         connect(sidebar->btnUpdate, &QPushButton::clicked, this, [this]() {
             state->formula = sidebar->formulaInput->text();
             sidebar->hideError();
-            glWidget->update();
+            fractalWidget->renderFractal();
         });
 
         // Connect Clear button
@@ -235,11 +232,8 @@ public:
             state->speed = value;
         });
 
-        connect(sidebar->scaleSlider, &QSlider::valueChanged, this, [this](int value) {
-            state->scaleSlider = value;
-            state->scale = sliderToScale(value);
-            sidebar->updateInfo(state->posX, state->posY, state->scale);
-            glWidget->update();
+        connect(sidebar->scaleSpeedSlider, &QSlider::valueChanged, this, [this](int value) {
+            state->scaleSpeed = value;
         });
 
         // Game loop timer
@@ -258,38 +252,45 @@ public:
         state->clear();
         sidebar->formulaInput->clear();
         sidebar->speedSlider->setValue(1);
-        sidebar->scaleSlider->setValue(0);
+        sidebar->scaleSpeedSlider->setValue(0);
         sidebar->hideError();
         sidebar->updateInfo(state->posX, state->posY, state->scale);
-        glWidget->update();
+        fractalWidget->renderFractal();
     }
 
 protected:
     void gameLoop()
     {
         double moveSpeed = state->speed * 0.001;
-        bool moved = false;
+        bool changed = false;
 
         if (state->moveUp) {
             state->posY += moveSpeed;
-            moved = true;
+            changed = true;
         }
         if (state->moveDown) {
             state->posY -= moveSpeed;
-            moved = true;
+            changed = true;
         }
         if (state->moveLeft) {
             state->posX -= moveSpeed;
-            moved = true;
+            changed = true;
         }
         if (state->moveRight) {
             state->posX += moveSpeed;
-            moved = true;
+            changed = true;
         }
 
-        if (moved) {
+        // Update scale based on scaleSpeed
+        if (state->scaleSpeed != 0) {
+            double scaleMultiplier = 1.0 + state->scaleSpeed * 0.0001;
+            state->scale *= scaleMultiplier;
+            changed = true;
+        }
+
+        if (changed) {
             sidebar->updateInfo(state->posX, state->posY, state->scale);
-            glWidget->update();
+            fractalWidget->renderFractal();
         }
     }
 
@@ -351,7 +352,7 @@ protected:
 
 public:
     Sidebar2D *sidebar;
-    GLWidget2D *glWidget;
+    FractalWidget2D *fractalWidget;
     QTimer *gameTimer;
     FractalState *state;
 };

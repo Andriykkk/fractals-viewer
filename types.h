@@ -9,9 +9,9 @@ struct FractalState
     double posX = 0.0;
     double posY = 0.0;
     double posZ = 0.0;  // for 3D
-    double scale = 1.0;
-    int speed = 1;      // 0 to 100
-    int scaleSlider = 0; // -1000 to 1000
+    double scale = 1.0;        // actual scale for drawing
+    int speed = 1;             // movement speed 0 to 100
+    int scaleSpeed = 0;        // scale change speed -1000 to 1000
 
     // Movement flags
     bool moveUp = false;
@@ -27,7 +27,7 @@ struct FractalState
         posZ = 0.0;
         scale = 1.0;
         speed = 1;
-        scaleSlider = 0;
+        scaleSpeed = 0;
         moveUp = false;
         moveDown = false;
         moveLeft = false;

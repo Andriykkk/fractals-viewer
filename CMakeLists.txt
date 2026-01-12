@@ -13,7 +13,7 @@ add_executable(fractal_viewer
     utils.h
     landingpage.h
     fractal2d.h
-    fractal3d.h
+    # fractal3d.h
 )
 
 target_link_libraries(fractal_viewer PRIVATE

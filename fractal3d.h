@@ -278,9 +278,7 @@ public:
         });
 
         connect(sidebar->scaleSlider, &QSlider::valueChanged, this, [this](int value) {
-            state->scaleSlider = value;
-            state->scale = sliderToScale(value);
-            glWidget->update();
+            state->scaleSpeed = value;
         });
 
         // Game loop timer
