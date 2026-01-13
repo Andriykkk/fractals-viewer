@@ -11,13 +11,15 @@
 #include <QSlider>
 #include <QKeyEvent>
 #include <QTimer>
-#include <QImage>
-#include <QPainter>
-#include <QColor>
+#include <QGraphicsView>
+#include <QGraphicsScene>
+#include <QGraphicsPixmapItem>
 
 #include <map>
 #include <thread>
 #include <atomic>
+#include <cmath>
+#include <cstring>
 
 #include "types.h"
 #include "utils.h"
@@ -25,10 +27,29 @@
 // Pixel dimensions of each chunk (100x100 pixels)
 const int CHUNK_SIZE = 100;
 
-// Chunk structure: stores QImage for the chunk
+// Fast HSV to RGB (hue 0-359, returns 0xRRGGBB)
+inline uint32_t hsvToRgb(int hue)
+{
+    int h = hue % 360;
+    int hi = h / 60;
+    int f = h % 60;
+    int q = 255 - (255 * f / 60);
+    int t = 255 * f / 60;
+
+    switch (hi) {
+        case 0: return 0xFF0000 | (t << 8);           // R=255, G=t, B=0
+        case 1: return (q << 16) | 0x00FF00;          // R=q, G=255, B=0
+        case 2: return 0x00FF00 | t;                  // R=0, G=255, B=t
+        case 3: return (q << 8) | 0x0000FF;           // R=0, G=q, B=255
+        case 4: return (t << 16) | 0x0000FF;          // R=t, G=0, B=255
+        default: return 0xFF0000 | (q << 8);          // R=255, G=0, B=q
+    }
+}
+
+// Chunk structure: stores raw pixel data
 struct Chunk
 {
-    QImage image = QImage(CHUNK_SIZE, CHUNK_SIZE, QImage::Format_RGB32);
+    uint32_t data[CHUNK_SIZE * CHUNK_SIZE];
     bool rendered = false;
     bool processing = false;
 };
@@ -88,11 +109,12 @@ public:
         // Go through each pixel
         for (int py = 0; py < h; ++py)
         {
-            QRgb *line = reinterpret_cast<QRgb*>(image.scanLine(py));
+            uint32_t *line = reinterpret_cast<uint32_t*>(image.scanLine(py));
+            double worldY = posY + (centerY - py) * pixelSize;
+
             for (int px = 0; px < w; ++px)
             {
                 double worldX = posX + (px - centerX) * pixelSize;
-                double worldY = posY + (centerY - py) * pixelSize;
 
                 int chunkX = (int)floor(worldX / chunkWorldSize);
                 int chunkY = (int)floor(worldY / chunkWorldSize);
@@ -111,12 +133,11 @@ public:
                     if (localY < 0) localY = 0;
                     if (localY >= CHUNK_SIZE) localY = CHUNK_SIZE - 1;
 
-                    const QRgb *chunkLine = reinterpret_cast<const QRgb*>(chunk.image.constScanLine(localY));
-                    line[px] = chunkLine[localX];
+                    line[px] = chunk.data[localY * CHUNK_SIZE + localX];
                 }
                 else
                 {
-                    line[px] = qRgb(0, 0, 0);
+                    line[px] = 0x000000;
                     hasUnrenderedChunks = true;
 
                     if (!chunk.processing && activeThreads < numCores)
@@ -152,7 +173,7 @@ private:
     }
 
     // Calculate Mandelbrot color for world position (static for thread safety)
-    static QRgb calcMandelbrot(double cx, double cy, int maxIterations, int hueStart, int hueRange)
+    static uint32_t calcMandelbrot(double cx, double cy, int maxIterations, int hueStart, int hueRange)
     {
         double zx = 0.0;
         double zy = 0.0;
@@ -174,18 +195,18 @@ private:
 
         if (iterations == maxIterations)
         {
-            return qRgb(0, 0, 0);
+            return 0x000000;
         }
 
         int hue = (hueStart + iterations * hueRange / maxIterations) % 360;
-        return QColor::fromHsv(hue, 255, 255).rgb();
+        return hsvToRgb(hue);
     }
 
     // Render entire chunk (all 100x100 pixels)
     void renderChunk(int chunkX, int chunkY, double scale, int screenWidth, int maxIter, int hueStart, int hueRange, int gen)
     {
-        // Render to local image first
-        QImage localImage(CHUNK_SIZE, CHUNK_SIZE, QImage::Format_RGB32);
+        // Render to local buffer first
+        uint32_t localData[CHUNK_SIZE * CHUNK_SIZE];
 
         double pixelSize = 2.0 / (scale * screenWidth);
         double chunkWorldSize = CHUNK_SIZE * pixelSize;
@@ -195,11 +216,12 @@ private:
 
         for (int ly = 0; ly < CHUNK_SIZE; ++ly)
         {
+            double cy = chunkOriginY + ly * pixelSize;
+            uint32_t *row = localData + ly * CHUNK_SIZE;
             for (int lx = 0; lx < CHUNK_SIZE; ++lx)
             {
                 double cx = chunkOriginX + lx * pixelSize;
-                double cy = chunkOriginY + ly * pixelSize;
-                localImage.setPixel(lx, ly, calcMandelbrot(cx, cy, maxIter, hueStart, hueRange));
+                row[lx] = calcMandelbrot(cx, cy, maxIter, hueStart, hueRange);
             }
         }
 
@@ -208,7 +230,7 @@ private:
         {
             auto key = std::make_pair(chunkX, chunkY);
             Chunk &chunk = chunks[key];
-            chunk.image = localImage;
+            memcpy(chunk.data, localData, sizeof(localData));
             chunk.rendered = true;
             chunk.processing = false;
         }
@@ -250,10 +272,6 @@ protected:
         if (!image.isNull())
         {
             painter.drawImage(0, 0, image);
-        }
-        else
-        {
-            painter.fillRect(rect(), Qt::black);
         }
     }
 
