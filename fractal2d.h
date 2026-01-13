@@ -16,6 +16,8 @@
 #include <QColor>
 
 #include <map>
+#include <thread>
+#include <atomic>
 
 #include "types.h"
 #include "utils.h"
@@ -23,11 +25,12 @@
 // Pixel dimensions of each chunk (100x100 pixels)
 const int CHUNK_SIZE = 100;
 
-// Chunk structure: stores RGB values for each pixel in the chunk
+// Chunk structure: stores QImage for the chunk
 struct Chunk
 {
-    int data[CHUNK_SIZE][CHUNK_SIZE][3];  // RGB per pixel
-    bool rendered[CHUNK_SIZE][CHUNK_SIZE] = {};  // Per-pixel flag
+    QImage image = QImage(CHUNK_SIZE, CHUNK_SIZE, QImage::Format_RGB32);
+    bool rendered = false;
+    bool processing = false;
 };
 
 class FractalWidget2D : public QWidget
@@ -39,35 +42,90 @@ public:
         : QWidget(parent), state(sharedState)
     {
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        numCores = std::thread::hardware_concurrency();
+        if (numCores == 0) numCores = 4;  // fallback
     }
 
     FractalState *state;
+    int numCores = 4;
+    std::atomic<int> activeThreads{0};
 
     void renderFractal()
     {
         if (width() <= 0 || height() <= 0) return;
-
-        // Invalidate chunks if scale changed
-        if (state->scale != lastScale)
-        {
-            invalidateChunks();
-            lastScale = state->scale;
-        }
-
-        image = QImage(width(), height(), QImage::Format_RGB32);
 
         int w = width();
         int h = height();
         double scale = state->scale;
         double posX = state->posX;
         double posY = state->posY;
+        int maxIter = state->maxIterations;
+        int hueStart = state->hueStart;
+        int hueRange = state->hueRange;
 
+        // Invalidate chunks if scale or width changed
+        if (scale != lastScale || w != lastWidth)
+        {
+            invalidateChunks();
+            lastScale = scale;
+            lastWidth = w;
+        }
+
+        // Resize image if needed
+        if (image.width() != w || image.height() != h)
+        {
+            image = QImage(w, h, QImage::Format_RGB32);
+        }
+
+        double pixelSize = 2.0 / (scale * w);
+        double chunkWorldSize = CHUNK_SIZE * pixelSize;
+        double centerX = (w - 1) / 2.0;
+        double centerY = (h - 1) / 2.0;
+
+        // Go through each pixel
         for (int py = 0; py < h; ++py)
         {
+            QRgb *line = reinterpret_cast<QRgb*>(image.scanLine(py));
             for (int px = 0; px < w; ++px)
             {
-                QRgb color = renderPixel(px, py, w, h, posX, posY, scale);
-                image.setPixel(px, py, color);
+                double worldX = posX + (px - centerX) * pixelSize;
+                double worldY = posY + (centerY - py) * pixelSize;
+
+                int chunkX = (int)floor(worldX / chunkWorldSize);
+                int chunkY = (int)floor(worldY / chunkWorldSize);
+
+                auto key = std::make_pair(chunkX, chunkY);
+                Chunk &chunk = chunks[key];
+
+                if (chunk.rendered)
+                {
+                    double chunkOriginX = chunkX * chunkWorldSize;
+                    double chunkOriginY = chunkY * chunkWorldSize;
+                    int localX = (int)((worldX - chunkOriginX) / pixelSize);
+                    int localY = (int)((worldY - chunkOriginY) / pixelSize);
+                    if (localX < 0) localX = 0;
+                    if (localX >= CHUNK_SIZE) localX = CHUNK_SIZE - 1;
+                    if (localY < 0) localY = 0;
+                    if (localY >= CHUNK_SIZE) localY = CHUNK_SIZE - 1;
+
+                    const QRgb *chunkLine = reinterpret_cast<const QRgb*>(chunk.image.constScanLine(localY));
+                    line[px] = chunkLine[localX];
+                }
+                else
+                {
+                    line[px] = qRgb(0, 0, 0);
+
+                    if (!chunk.processing && activeThreads < numCores)
+                    {
+                        chunk.processing = true;
+                        activeThreads++;
+
+                        std::thread([this, chunkX, chunkY, scale, w, maxIter, hueStart, hueRange]() {
+                            renderChunk(chunkX, chunkY, scale, w, maxIter, hueStart, hueRange);
+                            activeThreads--;
+                        }).detach();
+                    }
+                }
             }
         }
 
@@ -75,32 +133,23 @@ public:
     }
 
 private:
-    QRgb renderPixel(int px, int py, int w, int h, double posX, double posY, double scale)
+
+    QImage image;
+    std::map<std::pair<int, int>, Chunk> chunks;
+    double lastScale = 0.0;
+    int lastWidth = 0;
+
+    void invalidateChunks()
     {
-        double pixelSize = 2.0 / (scale * w);
-        double chunkWorldSize = CHUNK_SIZE * pixelSize;
+        chunks.clear();
+    }
 
-        double centerX = (w - 1) / 2.0;
-        double centerY = (h - 1) / 2.0;
-        double offsetX = px - centerX;
-        double offsetY = centerY - py;
-
-        double cx = posX + offsetX * pixelSize;
-        double cy = posY + offsetY * pixelSize;
-
-        // Check chunk cache
-        int chunkX, chunkY, localX, localY;
-        int cached = getChunkColor(cx, cy, chunkWorldSize, pixelSize, chunkX, chunkY, localX, localY);
-        if (cached != -1)
-        {
-            return cached;
-        }
-
-        // Mandelbrot iteration: z = z^2 + c, starting with z = 0
+    // Calculate Mandelbrot color for world position (static for thread safety)
+    static QRgb calcMandelbrot(double cx, double cy, int maxIterations, int hueStart, int hueRange)
+    {
         double zx = 0.0;
         double zy = 0.0;
         int iterations = 0;
-        int maxIterations = state->maxIterations;
 
         while (iterations < maxIterations)
         {
@@ -116,72 +165,69 @@ private:
             iterations++;
         }
 
-        QRgb color;
         if (iterations == maxIterations)
         {
-            color = qRgb(0, 0, 0);
+            return qRgb(0, 0, 0);
         }
-        else
+
+        int hue = (hueStart + iterations * hueRange / maxIterations) % 360;
+        return QColor::fromHsv(hue, 255, 255).rgb();
+    }
+
+    // Render entire chunk (all 100x100 pixels)
+    void renderChunk(int chunkX, int chunkY, double scale, int screenWidth, int maxIter, int hueStart, int hueRange)
+    {
+        auto key = std::make_pair(chunkX, chunkY);
+        Chunk &chunk = chunks[key];
+
+        double pixelSize = 2.0 / (scale * screenWidth);
+        double chunkWorldSize = CHUNK_SIZE * pixelSize;
+
+        // Chunk origin in world space
+        double chunkOriginX = chunkX * chunkWorldSize;
+        double chunkOriginY = chunkY * chunkWorldSize;
+
+        for (int ly = 0; ly < CHUNK_SIZE; ++ly)
         {
-            int hue = (state->hueStart + iterations * state->hueRange / maxIterations) % 360;
-            color = QColor::fromHsv(hue, 255, 255).rgb();
+            for (int lx = 0; lx < CHUNK_SIZE; ++lx)
+            {
+                double cx = chunkOriginX + lx * pixelSize;
+                double cy = chunkOriginY + ly * pixelSize;
+                chunk.image.setPixel(lx, ly, calcMandelbrot(cx, cy, maxIter, hueStart, hueRange));
+            }
         }
 
-        // Store in chunk cache
-        setChunkColor(chunkX, chunkY, localX, localY, color);
-
-        return color;
+        chunk.rendered = true;
+        chunk.processing = false;
     }
 
-    QImage image;
-    std::map<std::pair<int, int>, Chunk> chunks;
-    double lastScale = 0.0;
-
-    void invalidateChunks()
+    // Calculate world position and chunk info for a screen pixel
+    void pixelToWorld(int px, int py, int w, int h, double posX, double posY, double scale,
+                      double &worldX, double &worldY, int &chunkX, int &chunkY, int &localX, int &localY)
     {
-        chunks.clear();
-    }
+        double pixelSize = 2.0 / (scale * w);
+        double chunkWorldSize = CHUNK_SIZE * pixelSize;
 
-    // Returns cached color if available, or -1 if needs rendering
-    // Always calculates chunk key and local coords for caching
-    int getChunkColor(double worldX, double worldY, double chunkWorldSize, double pixelSize,
-                      int &chunkX, int &chunkY, int &localX, int &localY)
-    {
+        double centerX = (w - 1) / 2.0;
+        double centerY = (h - 1) / 2.0;
+
+        worldX = posX + (px - centerX) * pixelSize;
+        worldY = posY + (centerY - py) * pixelSize;
+
         chunkX = (int)floor(worldX / chunkWorldSize);
         chunkY = (int)floor(worldY / chunkWorldSize);
 
-        // Always calculate local coords
         double chunkOriginX = chunkX * chunkWorldSize;
         double chunkOriginY = chunkY * chunkWorldSize;
+
         localX = (int)floor((worldX - chunkOriginX) / pixelSize);
         localY = (int)floor((worldY - chunkOriginY) / pixelSize);
 
-        // Clamp to valid range
+        // Clamp
         if (localX < 0) localX = 0;
         if (localX >= CHUNK_SIZE) localX = CHUNK_SIZE - 1;
         if (localY < 0) localY = 0;
         if (localY >= CHUNK_SIZE) localY = CHUNK_SIZE - 1;
-
-        auto key = std::make_pair(chunkX, chunkY);
-        auto it = chunks.find(key);
-
-        if (it != chunks.end() && it->second.rendered[localY][localX])
-        {
-            const auto &data = it->second.data[localY][localX];
-            return qRgb(data[0], data[1], data[2]);
-        }
-
-        return -1;  // needs rendering
-    }
-
-    void setChunkColor(int chunkX, int chunkY, int localX, int localY, QRgb color)
-    {
-        auto key = std::make_pair(chunkX, chunkY);
-        Chunk &chunk = chunks[key];
-        chunk.data[localY][localX][0] = qRed(color);
-        chunk.data[localY][localX][1] = qGreen(color);
-        chunk.data[localY][localX][2] = qBlue(color);
-        chunk.rendered[localY][localX] = true;
     }
 
 protected:
