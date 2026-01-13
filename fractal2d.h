@@ -472,9 +472,9 @@ public:
     void updateInfo(double x, double y, double scale)
     {
         frameInfoText->setText(QString("X: %1\nY: %2\nScale: %3x")
-            .arg(x, 0, 'f', 2)
-            .arg(y, 0, 'f', 2)
-            .arg(scale, 0, 'f', scale < 10 ? 2 : 0));
+            .arg(x, 0, 'g', 4)
+            .arg(y, 0, 'g', 4)
+            .arg(scale, 0, 'g', 4));
     }
 
     void showError(const QString &message)
