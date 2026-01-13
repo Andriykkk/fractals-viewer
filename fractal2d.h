@@ -11,15 +11,15 @@
 #include <QSlider>
 #include <QKeyEvent>
 #include <QTimer>
-#include <QGraphicsView>
-#include <QGraphicsScene>
-#include <QGraphicsPixmapItem>
+#include <QPainter>
+#include <QDebug>
 
 #include <map>
 #include <thread>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <chrono>
 
 #include "types.h"
 #include "utils.h"
@@ -76,6 +76,8 @@ public:
     {
         if (width() <= 0 || height() <= 0) return;
 
+        auto t0 = std::chrono::high_resolution_clock::now();
+
         int w = width();
         int h = height();
         double scale = state->scale;
@@ -106,38 +108,70 @@ public:
 
         hasUnrenderedChunks = false;
 
-        // Go through each pixel
-        for (int py = 0; py < h; ++py)
+        // Calculate which chunks are visible
+        double worldLeft = posX - centerX * pixelSize;
+        double worldRight = posX + (w - 1 - centerX) * pixelSize;
+        double worldTop = posY + centerY * pixelSize;
+        double worldBottom = posY - (h - 1 - centerY) * pixelSize;
+
+        int chunkMinX = (int)floor(worldLeft / chunkWorldSize);
+        int chunkMaxX = (int)floor(worldRight / chunkWorldSize);
+        int chunkMinY = (int)floor(worldBottom / chunkWorldSize);
+        int chunkMaxY = (int)floor(worldTop / chunkWorldSize);
+
+        // Process each visible chunk
+        for (int cy = chunkMinY; cy <= chunkMaxY; ++cy)
         {
-            uint32_t *line = reinterpret_cast<uint32_t*>(image.scanLine(py));
-            double worldY = posY + (centerY - py) * pixelSize;
-
-            for (int px = 0; px < w; ++px)
+            for (int cx = chunkMinX; cx <= chunkMaxX; ++cx)
             {
-                double worldX = posX + (px - centerX) * pixelSize;
-
-                int chunkX = (int)floor(worldX / chunkWorldSize);
-                int chunkY = (int)floor(worldY / chunkWorldSize);
-
-                auto key = std::make_pair(chunkX, chunkY);
+                auto key = std::make_pair(cx, cy);
                 Chunk &chunk = chunks[key];
+
+                // Calculate screen region for this chunk
+                double chunkWorldLeft = cx * chunkWorldSize;
+                double chunkWorldBottom = cy * chunkWorldSize;
+
+                // Screen coords where chunk starts
+                int screenStartX = (int)((chunkWorldLeft - posX) / pixelSize + centerX);
+                int screenStartY = (int)(centerY - (chunkWorldBottom + chunkWorldSize - posY) / pixelSize);
 
                 if (chunk.rendered)
                 {
-                    double chunkOriginX = chunkX * chunkWorldSize;
-                    double chunkOriginY = chunkY * chunkWorldSize;
-                    int localX = (int)((worldX - chunkOriginX) / pixelSize);
-                    int localY = (int)((worldY - chunkOriginY) / pixelSize);
-                    if (localX < 0) localX = 0;
-                    if (localX >= CHUNK_SIZE) localX = CHUNK_SIZE - 1;
-                    if (localY < 0) localY = 0;
-                    if (localY >= CHUNK_SIZE) localY = CHUNK_SIZE - 1;
+                    // Copy chunk data to image
+                    for (int ly = 0; ly < CHUNK_SIZE; ++ly)
+                    {
+                        int screenY = screenStartY + ly;
+                        if (screenY < 0 || screenY >= h) continue;
 
-                    line[px] = chunk.data[localY * CHUNK_SIZE + localX];
+                        uint32_t *line = reinterpret_cast<uint32_t*>(image.scanLine(screenY));
+                        int chunkRow = CHUNK_SIZE - 1 - ly;  // flip Y
+
+                        for (int lx = 0; lx < CHUNK_SIZE; ++lx)
+                        {
+                            int screenX = screenStartX + lx;
+                            if (screenX < 0 || screenX >= w) continue;
+
+                            line[screenX] = chunk.data[chunkRow * CHUNK_SIZE + lx];
+                        }
+                    }
                 }
                 else
                 {
-                    line[px] = 0x000000;
+                    // Fill with black and start rendering
+                    for (int ly = 0; ly < CHUNK_SIZE; ++ly)
+                    {
+                        int screenY = screenStartY + ly;
+                        if (screenY < 0 || screenY >= h) continue;
+
+                        uint32_t *line = reinterpret_cast<uint32_t*>(image.scanLine(screenY));
+                        for (int lx = 0; lx < CHUNK_SIZE; ++lx)
+                        {
+                            int screenX = screenStartX + lx;
+                            if (screenX < 0 || screenX >= w) continue;
+                            line[screenX] = 0x000000;
+                        }
+                    }
+
                     hasUnrenderedChunks = true;
 
                     if (!chunk.processing && activeThreads < numCores)
@@ -146,14 +180,18 @@ public:
                         activeThreads++;
                         int gen = generation;
 
-                        std::thread([this, chunkX, chunkY, scale, w, maxIter, hueStart, hueRange, gen]() {
-                            renderChunk(chunkX, chunkY, scale, w, maxIter, hueStart, hueRange, gen);
+                        std::thread([this, cx, cy, scale, w, maxIter, hueStart, hueRange, gen]() {
+                            renderChunk(cx, cy, scale, w, maxIter, hueStart, hueRange, gen);
                             activeThreads--;
                         }).detach();
                     }
                 }
             }
         }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        qDebug() << "renderFractal took" << ms << "us";
 
         update();
     }
@@ -565,11 +603,13 @@ protected:
             changed = true;
         }
 
-        // Update scale based on scaleSpeed (cubic curve for slow center, fast extremes)
+        // Update scale based on scaleSpeed
+        // At max speed (1000), scale changes 3x per second (60 FPS)
+        // 3^(1/60) ≈ 1.0186, so max multiplier per frame is ~0.0186
         if (state->scaleSpeed != 0) {
             double normalized = state->scaleSpeed / 1000.0;  // -1 to 1
             double curved = normalized * normalized * normalized;  // cubic: preserves sign
-            double scaleMultiplier = 1.0 + curved * 0.1;
+            double scaleMultiplier = pow(3.0, curved / 60.0);  // 3x per second at max
             state->scale *= scaleMultiplier;
             changed = true;
         }
