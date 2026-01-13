@@ -10,6 +10,7 @@
 #include <QLineEdit>
 #include <QSlider>
 #include <QKeyEvent>
+#include <QWheelEvent>
 #include <QTimer>
 #include <QPainter>
 #include <QDebug>
@@ -75,8 +76,6 @@ public:
     void renderFractal()
     {
         if (width() <= 0 || height() <= 0) return;
-
-        auto t0 = std::chrono::high_resolution_clock::now();
 
         int w = width();
         int h = height();
@@ -188,10 +187,6 @@ public:
                 }
             }
         }
-
-        auto t1 = std::chrono::high_resolution_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-        qDebug() << "renderFractal took" << ms << "us";
 
         update();
     }
@@ -364,6 +359,14 @@ public:
         btnLayout->addWidget(btnClear);
         layout->addLayout(btnLayout);
 
+        // Scale buttons
+        auto *scaleButtonLayout = new QHBoxLayout();
+        btnHalfScale = new QPushButton("0.5x");
+        btnDoubleScale = new QPushButton("2x");
+        scaleButtonLayout->addWidget(btnHalfScale);
+        scaleButtonLayout->addWidget(btnDoubleScale);
+        layout->addLayout(scaleButtonLayout);
+
         layout->addSpacing(20);
 
         // Speed slider
@@ -491,6 +494,8 @@ public:
     QPushButton *btnBack;
     QPushButton *btnUpdate;
     QPushButton *btnClear;
+    QPushButton *btnHalfScale;
+    QPushButton *btnDoubleScale;
     QLineEdit *formulaInput;
     QLabel *errorLabel;
     QLabel *frameInfoText;
@@ -527,32 +532,64 @@ public:
             state->formula = sidebar->formulaInput->text();
             sidebar->hideError();
             fractalWidget->renderFractal();
+            setFocus();
         });
 
         // Connect Clear button
         connect(sidebar->btnClear, &QPushButton::clicked, this, [this]() {
             resetState();
+            setFocus();
+        });
+
+        // Connect scale buttons
+        connect(sidebar->btnHalfScale, &QPushButton::clicked, this, [this]() {
+            state->scale *= 0.5;
+            sidebar->updateInfo(state->posX, state->posY, state->scale);
+            fractalWidget->renderFractal();
+            setFocus();
+        });
+
+        connect(sidebar->btnDoubleScale, &QPushButton::clicked, this, [this]() {
+            state->scale *= 2.0;
+            sidebar->updateInfo(state->posX, state->posY, state->scale);
+            fractalWidget->renderFractal();
+            setFocus();
         });
 
         // Connect sliders
         connect(sidebar->speedSlider, &QSlider::valueChanged, this, [this](int value) {
             state->speed = value;
         });
-
+        connect(sidebar->speedSlider, &QSlider::sliderReleased, this, [this]() {
+            setFocus();
+        });
 
         connect(sidebar->maxIterSlider, &QSlider::valueChanged, this, [this](int value) {
             state->maxIterations = value;
             fractalWidget->renderFractal();
+        });
+        connect(sidebar->maxIterSlider, &QSlider::sliderReleased, this, [this]() {
+            setFocus();
         });
 
         connect(sidebar->hueRangeSlider, &QSlider::valueChanged, this, [this](int value) {
             state->hueRange = value;
             fractalWidget->renderFractal();
         });
+        connect(sidebar->hueRangeSlider, &QSlider::sliderReleased, this, [this]() {
+            setFocus();
+        });
 
         connect(sidebar->hueStartSlider, &QSlider::valueChanged, this, [this](int value) {
             state->hueStart = value;
             fractalWidget->renderFractal();
+        });
+        connect(sidebar->hueStartSlider, &QSlider::sliderReleased, this, [this]() {
+            setFocus();
+        });
+
+        connect(sidebar->scaleSpeedSlider, &QSlider::sliderReleased, this, [this]() {
+            setFocus();
         });
 
         // Game loop timer
@@ -678,6 +715,18 @@ protected:
             QWidget::keyReleaseEvent(event);
             return;
         }
+    }
+
+    void wheelEvent(QWheelEvent *event) override
+    {
+        // Scroll up = zoom in (double), scroll down = zoom out (half)
+        if (event->angleDelta().y() > 0) {
+            state->scale *= 2.0;
+        } else if (event->angleDelta().y() < 0) {
+            state->scale *= 0.5;
+        }
+        sidebar->updateInfo(state->posX, state->posY, state->scale);
+        fractalWidget->renderFractal();
     }
 
 public:
