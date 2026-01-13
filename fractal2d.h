@@ -49,6 +49,7 @@ public:
     FractalState *state;
     int numCores = 4;
     std::atomic<int> activeThreads{0};
+    bool hasUnrenderedChunks = false;
 
     void renderFractal()
     {
@@ -82,6 +83,8 @@ public:
         double centerX = (w - 1) / 2.0;
         double centerY = (h - 1) / 2.0;
 
+        hasUnrenderedChunks = false;
+
         // Go through each pixel
         for (int py = 0; py < h; ++py)
         {
@@ -114,14 +117,16 @@ public:
                 else
                 {
                     line[px] = qRgb(0, 0, 0);
+                    hasUnrenderedChunks = true;
 
                     if (!chunk.processing && activeThreads < numCores)
                     {
                         chunk.processing = true;
                         activeThreads++;
+                        int gen = generation;
 
-                        std::thread([this, chunkX, chunkY, scale, w, maxIter, hueStart, hueRange]() {
-                            renderChunk(chunkX, chunkY, scale, w, maxIter, hueStart, hueRange);
+                        std::thread([this, chunkX, chunkY, scale, w, maxIter, hueStart, hueRange, gen]() {
+                            renderChunk(chunkX, chunkY, scale, w, maxIter, hueStart, hueRange, gen);
                             activeThreads--;
                         }).detach();
                     }
@@ -138,9 +143,11 @@ private:
     std::map<std::pair<int, int>, Chunk> chunks;
     double lastScale = 0.0;
     int lastWidth = 0;
+    std::atomic<int> generation{0};
 
     void invalidateChunks()
     {
+        generation++;
         chunks.clear();
     }
 
@@ -175,15 +182,14 @@ private:
     }
 
     // Render entire chunk (all 100x100 pixels)
-    void renderChunk(int chunkX, int chunkY, double scale, int screenWidth, int maxIter, int hueStart, int hueRange)
+    void renderChunk(int chunkX, int chunkY, double scale, int screenWidth, int maxIter, int hueStart, int hueRange, int gen)
     {
-        auto key = std::make_pair(chunkX, chunkY);
-        Chunk &chunk = chunks[key];
+        // Render to local image first
+        QImage localImage(CHUNK_SIZE, CHUNK_SIZE, QImage::Format_RGB32);
 
         double pixelSize = 2.0 / (scale * screenWidth);
         double chunkWorldSize = CHUNK_SIZE * pixelSize;
 
-        // Chunk origin in world space
         double chunkOriginX = chunkX * chunkWorldSize;
         double chunkOriginY = chunkY * chunkWorldSize;
 
@@ -193,12 +199,19 @@ private:
             {
                 double cx = chunkOriginX + lx * pixelSize;
                 double cy = chunkOriginY + ly * pixelSize;
-                chunk.image.setPixel(lx, ly, calcMandelbrot(cx, cy, maxIter, hueStart, hueRange));
+                localImage.setPixel(lx, ly, calcMandelbrot(cx, cy, maxIter, hueStart, hueRange));
             }
         }
 
-        chunk.rendered = true;
-        chunk.processing = false;
+        // Only store result if generation hasn't changed
+        if (generation == gen)
+        {
+            auto key = std::make_pair(chunkX, chunkY);
+            Chunk &chunk = chunks[key];
+            chunk.image = localImage;
+            chunk.rendered = true;
+            chunk.processing = false;
+        }
     }
 
     // Calculate world position and chunk info for a screen pixel
@@ -321,7 +334,13 @@ public:
         scaleSpeedSlider->setValue(state->scaleSpeed);
         layout->addWidget(scaleSpeedSlider);
 
-        connect(scaleSpeedSlider, &QSlider::valueChanged, this, [scaleSpeedLabel](int value) {
+        connect(scaleSpeedSlider, &QSlider::valueChanged, this, [this, scaleSpeedLabel](int value) {
+            // Snap to zero when close to center
+            if (value > -50 && value < 50 && value != 0) {
+                scaleSpeedSlider->setValue(0);
+                return;
+            }
+            state->scaleSpeed = value;
             scaleSpeedLabel->setText(QString("Scale Speed: %1").arg(value));
         });
 
@@ -464,9 +483,6 @@ public:
             state->speed = value;
         });
 
-        connect(sidebar->scaleSpeedSlider, &QSlider::valueChanged, this, [this](int value) {
-            state->scaleSpeed = value;
-        });
 
         connect(sidebar->maxIterSlider, &QSlider::valueChanged, this, [this](int value) {
             state->maxIterations = value;
@@ -531,15 +547,21 @@ protected:
             changed = true;
         }
 
-        // Update scale based on scaleSpeed
+        // Update scale based on scaleSpeed (cubic curve for slow center, fast extremes)
         if (state->scaleSpeed != 0) {
-            double scaleMultiplier = 1.0 + state->scaleSpeed * 0.0001;
+            double normalized = state->scaleSpeed / 1000.0;  // -1 to 1
+            double curved = normalized * normalized * normalized;  // cubic: preserves sign
+            double scaleMultiplier = 1.0 + curved * 0.1;
             state->scale *= scaleMultiplier;
             changed = true;
         }
 
         if (changed) {
             sidebar->updateInfo(state->posX, state->posY, state->scale);
+        }
+
+        // Render if something changed or there are unrendered chunks
+        if (changed || fractalWidget->hasUnrenderedChunks) {
             fractalWidget->renderFractal();
         }
     }
