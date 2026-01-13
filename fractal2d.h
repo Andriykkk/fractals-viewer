@@ -15,8 +15,20 @@
 #include <QPainter>
 #include <QColor>
 
+#include <map>
+
 #include "types.h"
 #include "utils.h"
+
+// Pixel dimensions of each chunk (100x100 pixels)
+const int CHUNK_SIZE = 100;
+
+// Chunk structure: stores RGB values for each pixel in the chunk
+struct Chunk
+{
+    int data[CHUNK_SIZE][CHUNK_SIZE][3];  // RGB per pixel
+    bool rendered[CHUNK_SIZE][CHUNK_SIZE] = {};  // Per-pixel flag
+};
 
 class FractalWidget2D : public QWidget
 {
@@ -34,6 +46,13 @@ public:
     void renderFractal()
     {
         if (width() <= 0 || height() <= 0) return;
+
+        // Invalidate chunks if scale changed
+        if (state->scale != lastScale)
+        {
+            invalidateChunks();
+            lastScale = state->scale;
+        }
 
         image = QImage(width(), height(), QImage::Format_RGB32);
 
@@ -58,22 +77,24 @@ public:
 private:
     QRgb renderPixel(int px, int py, int w, int h, double posX, double posY, double scale)
     {
-        // At scale 1, width shows range of 2 (-1 to 1)
-        // Each pixel represents (2 / scale) / w units in world space
         double pixelSize = 2.0 / (scale * w);
+        double chunkWorldSize = CHUNK_SIZE * pixelSize;
 
-        // Distance from center pixel (handles both odd and even dimensions)
-        // For w=5: center is 2.0, pixels 0,1,2,3,4 have offsets -2,-1,0,1,2
-        // For w=4: center is 1.5, pixels 0,1,2,3 have offsets -1.5,-0.5,0.5,1.5
         double centerX = (w - 1) / 2.0;
         double centerY = (h - 1) / 2.0;
-
         double offsetX = px - centerX;
-        double offsetY = centerY - py;  // Y is inverted (screen Y goes down)
+        double offsetY = centerY - py;
 
-        // Map to world coordinates (this is c in the Mandelbrot formula)
         double cx = posX + offsetX * pixelSize;
         double cy = posY + offsetY * pixelSize;
+
+        // Check chunk cache
+        int chunkX, chunkY, localX, localY;
+        int cached = getChunkColor(cx, cy, chunkWorldSize, pixelSize, chunkX, chunkY, localX, localY);
+        if (cached != -1)
+        {
+            return cached;
+        }
 
         // Mandelbrot iteration: z = z^2 + c, starting with z = 0
         double zx = 0.0;
@@ -86,10 +107,8 @@ private:
             double zx2 = zx * zx;
             double zy2 = zy * zy;
 
-            // Check escape condition: |z| > 2
             if (zx2 + zy2 > 4.0) break;
 
-            // z = z^2 + c
             double newZx = zx2 - zy2 + cx;
             zy = 2.0 * zx * zy + cy;
             zx = newZx;
@@ -97,16 +116,72 @@ private:
             iterations++;
         }
 
-        // Black for points inside the set (reached max iterations)
+        QRgb color;
         if (iterations == maxIterations)
         {
-            return qRgb(0, 0, 0);
+            color = qRgb(0, 0, 0);
+        }
+        else
+        {
+            int hue = (state->hueStart + iterations * state->hueRange / maxIterations) % 360;
+            color = QColor::fromHsv(hue, 255, 255).rgb();
         }
 
-        // HSV color based on iteration count
-        int hue = (state->hueStart + iterations * state->hueRange / maxIterations) % 360;
-        QColor color = QColor::fromHsv(hue, 255, 255);
-        return color.rgb();
+        // Store in chunk cache
+        setChunkColor(chunkX, chunkY, localX, localY, color);
+
+        return color;
+    }
+
+    QImage image;
+    std::map<std::pair<int, int>, Chunk> chunks;
+    double lastScale = 0.0;
+
+    void invalidateChunks()
+    {
+        chunks.clear();
+    }
+
+    // Returns cached color if available, or -1 if needs rendering
+    // Always calculates chunk key and local coords for caching
+    int getChunkColor(double worldX, double worldY, double chunkWorldSize, double pixelSize,
+                      int &chunkX, int &chunkY, int &localX, int &localY)
+    {
+        chunkX = (int)floor(worldX / chunkWorldSize);
+        chunkY = (int)floor(worldY / chunkWorldSize);
+
+        // Always calculate local coords
+        double chunkOriginX = chunkX * chunkWorldSize;
+        double chunkOriginY = chunkY * chunkWorldSize;
+        localX = (int)floor((worldX - chunkOriginX) / pixelSize);
+        localY = (int)floor((worldY - chunkOriginY) / pixelSize);
+
+        // Clamp to valid range
+        if (localX < 0) localX = 0;
+        if (localX >= CHUNK_SIZE) localX = CHUNK_SIZE - 1;
+        if (localY < 0) localY = 0;
+        if (localY >= CHUNK_SIZE) localY = CHUNK_SIZE - 1;
+
+        auto key = std::make_pair(chunkX, chunkY);
+        auto it = chunks.find(key);
+
+        if (it != chunks.end() && it->second.rendered[localY][localX])
+        {
+            const auto &data = it->second.data[localY][localX];
+            return qRgb(data[0], data[1], data[2]);
+        }
+
+        return -1;  // needs rendering
+    }
+
+    void setChunkColor(int chunkX, int chunkY, int localX, int localY, QRgb color)
+    {
+        auto key = std::make_pair(chunkX, chunkY);
+        Chunk &chunk = chunks[key];
+        chunk.data[localY][localX][0] = qRed(color);
+        chunk.data[localY][localX][1] = qGreen(color);
+        chunk.data[localY][localX][2] = qBlue(color);
+        chunk.rendered[localY][localX] = true;
     }
 
 protected:
@@ -129,8 +204,6 @@ protected:
         renderFractal();
     }
 
-private:
-    QImage image;
 };
 
 class Sidebar2D : public QFrame
