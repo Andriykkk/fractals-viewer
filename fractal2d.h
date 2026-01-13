@@ -13,14 +13,12 @@
 #include <QWheelEvent>
 #include <QTimer>
 #include <QPainter>
-#include <QDebug>
 
 #include <map>
 #include <thread>
 #include <atomic>
 #include <cmath>
 #include <cstring>
-#include <chrono>
 
 #include "types.h"
 #include "utils.h"
@@ -82,16 +80,19 @@ public:
         double scale = state->scale;
         double posX = state->posX;
         double posY = state->posY;
-        int maxIter = state->maxIterations;
+        // Scale iterations with zoom - more detail at higher zoom
+        int maxIter = (int)(state->maxIterations * log2(scale + 1) + state->maxIterations);
         int hueStart = state->hueStart;
         int hueRange = state->hueRange;
 
-        // Invalidate chunks if scale or width changed
-        if (scale != lastScale || w != lastWidth)
+        // Invalidate chunks if scale, width, or hue settings changed
+        if (scale != lastScale || w != lastWidth || hueStart != lastHueStart || hueRange != lastHueRange)
         {
             invalidateChunks();
             lastScale = scale;
             lastWidth = w;
+            lastHueStart = hueStart;
+            lastHueRange = hueRange;
         }
 
         // Resize image if needed
@@ -197,6 +198,8 @@ private:
     std::map<std::pair<int, int>, Chunk> chunks;
     double lastScale = 0.0;
     int lastWidth = 0;
+    int lastHueStart = -1;
+    int lastHueRange = -1;
     std::atomic<int> generation{0};
 
     void invalidateChunks()
@@ -620,7 +623,8 @@ public:
 protected:
     void gameLoop()
     {
-        double moveSpeed = state->speed * 0.001;
+        // Movement speed scales with zoom - move same visual distance regardless of scale
+        double moveSpeed = state->speed * 0.001 / state->scale;
         bool changed = false;
 
         if (state->moveUp) {
