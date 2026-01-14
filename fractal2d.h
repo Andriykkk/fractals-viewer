@@ -19,6 +19,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <vector>
+#include <complex>
+#include <mpfr.h>
 
 #include "types.h"
 #include "utils.h"
@@ -45,13 +48,133 @@ inline uint32_t hsvToRgb(int hue)
     }
 }
 
-// Chunk structure: stores raw pixel data
+// Reference orbit point (Z values during iteration, stored as doubles since |Z| <= 2)
+using ComplexD = std::complex<double>;
+
+// Chunk structure: stores raw pixel data and reference orbit
 struct Chunk
 {
     uint32_t data[CHUNK_SIZE * CHUNK_SIZE];
     bool rendered = false;
     bool processing = false;
+
+    // Reference orbit for perturbation theory
+    // Stores Z values at each iteration for the chunk center point
+    // Multiple reference points can be used for better accuracy
+    std::vector<std::vector<ComplexD>> referenceOrbits;
+
+    // Escape iteration for each reference point (-1 if doesn't escape)
+    std::vector<int> referenceEscapeIter;
 };
+
+// Compute reference orbit using high-precision arithmetic
+// Returns the orbit (Z values at each iteration) and escape iteration (-1 if doesn't escape)
+inline std::pair<std::vector<ComplexD>, int> computeReferenceOrbit(
+    const MPFRFloat& cReal, const MPFRFloat& cImag,
+    int maxIter, mpfr_prec_t precision)
+{
+    std::vector<ComplexD> orbit;
+    orbit.reserve(maxIter);
+
+    MPFRFloat zReal(precision), zImag(precision);
+    MPFRFloat zReal2(precision), zImag2(precision);
+    MPFRFloat temp(precision);
+
+    zReal.set(0.0);
+    zImag.set(0.0);
+
+    for (int i = 0; i < maxIter; ++i)
+    {
+        // Store current Z as double (fits because |Z| <= 2)
+        orbit.push_back(ComplexD(zReal.toDouble(), zImag.toDouble()));
+
+        // z = z^2 + c
+        // zReal2 = zReal^2, zImag2 = zImag^2
+        zReal2.mul(zReal, zReal);
+        zImag2.mul(zImag, zImag);
+
+        // Check escape: |z|^2 > 4
+        temp.add(zReal2, zImag2);
+        if (temp.toDouble() > 4.0)
+        {
+            return {orbit, i};
+        }
+
+        // newZImag = 2 * zReal * zImag + cImag
+        temp.mul(zReal, zImag);
+        temp.mul_d(temp, 2.0);
+        temp.add(temp, cImag);
+
+        // newZReal = zReal2 - zImag2 + cReal
+        zReal.sub(zReal2, zImag2);
+        zReal.add(zReal, cReal);
+
+        zImag.set(temp);
+    }
+
+    return {orbit, -1};  // Doesn't escape
+}
+
+// Perturbation iteration for a single pixel
+// Returns iteration count where it escapes, or -1 if doesn't escape
+inline int perturbationIterate(
+    const std::vector<ComplexD>& refOrbit,
+    int refEscapeIter,
+    ComplexD deltaC,
+    int maxIter,
+    bool& glitched)
+{
+    ComplexD delta(0.0, 0.0);
+    glitched = false;
+
+    int orbitLen = (int)refOrbit.size();
+    int limit = (refEscapeIter >= 0) ? std::min(refEscapeIter, maxIter) : maxIter;
+
+    for (int i = 0; i < limit && i < orbitLen; ++i)
+    {
+        ComplexD Z = refOrbit[i];
+
+        // Full value: W = Z + delta
+        ComplexD W = Z + delta;
+
+        // Check escape
+        if (std::norm(W) > 4.0)
+        {
+            return i;
+        }
+
+        // Glitch detection: if |delta| > |Z| * 1e6, reference is not useful
+        // This happens when delta dominates and we lose precision
+        double Znorm = std::norm(Z);
+        double deltaNorm = std::norm(delta);
+        if (Znorm > 1e-20 && deltaNorm > Znorm * 1e12)
+        {
+            glitched = true;
+            return i;
+        }
+
+        // Perturbation formula: delta_next = 2*Z*delta + delta^2 + deltaC
+        delta = 2.0 * Z * delta + delta * delta + deltaC;
+    }
+
+    // If reference escaped but we didn't, continue with direct iteration
+    if (refEscapeIter >= 0 && refEscapeIter < maxIter)
+    {
+        // Use the last W value and continue iterating directly
+        ComplexD W = refOrbit.back() + delta;
+        for (int i = refEscapeIter; i < maxIter; ++i)
+        {
+            if (std::norm(W) > 4.0)
+            {
+                return i;
+            }
+            W = W * W + ComplexD(refOrbit[0].real(), refOrbit[0].imag()) + deltaC;
+            // Note: this loses precision at deep zooms, but handles edge cases
+        }
+    }
+
+    return -1;  // Doesn't escape
+}
 
 class FractalWidget2D : public QWidget
 {
@@ -77,9 +200,9 @@ public:
 
         int w = width();
         int h = height();
-        double scale = state->scale;
-        double posX = state->posX;
-        double posY = state->posY;
+        double scale = state->scale.toDouble();
+        double posX = state->posX.toDouble();
+        double posY = state->posY.toDouble();
         // Scale iterations with zoom - more detail at higher zoom
         int maxIter = (int)(state->maxIterations * log2(scale + 1) + state->maxIterations);
         int hueStart = state->hueStart;
@@ -89,6 +212,7 @@ public:
         if (scale != lastScale || w != lastWidth || hueStart != lastHueStart || hueRange != lastHueRange)
         {
             invalidateChunks();
+            state->updatePrecision();  // Increase precision if needed for new scale
             lastScale = scale;
             lastWidth = w;
             lastHueStart = hueStart;
@@ -272,35 +396,6 @@ private:
         }
     }
 
-    // Calculate world position and chunk info for a screen pixel
-    void pixelToWorld(int px, int py, int w, int h, double posX, double posY, double scale,
-                      double &worldX, double &worldY, int &chunkX, int &chunkY, int &localX, int &localY)
-    {
-        double pixelSize = 2.0 / (scale * w);
-        double chunkWorldSize = CHUNK_SIZE * pixelSize;
-
-        double centerX = (w - 1) / 2.0;
-        double centerY = (h - 1) / 2.0;
-
-        worldX = posX + (px - centerX) * pixelSize;
-        worldY = posY + (centerY - py) * pixelSize;
-
-        chunkX = (int)floor(worldX / chunkWorldSize);
-        chunkY = (int)floor(worldY / chunkWorldSize);
-
-        double chunkOriginX = chunkX * chunkWorldSize;
-        double chunkOriginY = chunkY * chunkWorldSize;
-
-        localX = (int)floor((worldX - chunkOriginX) / pixelSize);
-        localY = (int)floor((worldY - chunkOriginY) / pixelSize);
-
-        // Clamp
-        if (localX < 0) localX = 0;
-        if (localX >= CHUNK_SIZE) localX = CHUNK_SIZE - 1;
-        if (localY < 0) localY = 0;
-        if (localY >= CHUNK_SIZE) localY = CHUNK_SIZE - 1;
-    }
-
 protected:
     void paintEvent(QPaintEvent *) override
     {
@@ -461,9 +556,9 @@ public:
         frameInfoText->setStyleSheet("font-size: 11px; color: #000000;");
         frameInfoText->setWordWrap(true);
         frameInfoText->setText(QString("X: %1\nY: %2\nScale: %3x")
-            .arg(state->posX, 0, 'f', 2)
-            .arg(state->posY, 0, 'f', 2)
-            .arg(state->scale, 0, 'f', 2));
+            .arg(state->posX.toDouble(), 0, 'f', 2)
+            .arg(state->posY.toDouble(), 0, 'f', 2)
+            .arg(state->scale.toDouble(), 0, 'f', 2));
         layout->addWidget(frameInfoText);
 
         layout->addStretch();
@@ -546,15 +641,15 @@ public:
 
         // Connect scale buttons
         connect(sidebar->btnHalfScale, &QPushButton::clicked, this, [this]() {
-            state->scale *= 0.5;
-            sidebar->updateInfo(state->posX, state->posY, state->scale);
+            state->scale.mul_inplace(0.5);
+            sidebar->updateInfo(state->posX.toDouble(), state->posY.toDouble(), state->scale.toDouble());
             fractalWidget->renderFractal();
             setFocus();
         });
 
         connect(sidebar->btnDoubleScale, &QPushButton::clicked, this, [this]() {
-            state->scale *= 2.0;
-            sidebar->updateInfo(state->posX, state->posY, state->scale);
+            state->scale.mul_inplace(2.0);
+            sidebar->updateInfo(state->posX.toDouble(), state->posY.toDouble(), state->scale.toDouble());
             fractalWidget->renderFractal();
             setFocus();
         });
@@ -616,7 +711,7 @@ public:
         sidebar->hueRangeSlider->setValue(state->hueRange);
         sidebar->hueStartSlider->setValue(state->hueStart);
         sidebar->hideError();
-        sidebar->updateInfo(state->posX, state->posY, state->scale);
+        sidebar->updateInfo(state->posX.toDouble(), state->posY.toDouble(), state->scale.toDouble());
         fractalWidget->renderFractal();
     }
 
@@ -624,23 +719,23 @@ protected:
     void gameLoop()
     {
         // Movement speed scales with zoom - move same visual distance regardless of scale
-        double moveSpeed = state->speed * 0.001 / state->scale;
+        double moveSpeed = state->speed * 0.001 / state->scale.toDouble();
         bool changed = false;
 
         if (state->moveUp) {
-            state->posY += moveSpeed;
+            state->posY.add_inplace(moveSpeed);
             changed = true;
         }
         if (state->moveDown) {
-            state->posY -= moveSpeed;
+            state->posY.add_inplace(-moveSpeed);
             changed = true;
         }
         if (state->moveLeft) {
-            state->posX -= moveSpeed;
+            state->posX.add_inplace(-moveSpeed);
             changed = true;
         }
         if (state->moveRight) {
-            state->posX += moveSpeed;
+            state->posX.add_inplace(moveSpeed);
             changed = true;
         }
 
@@ -651,12 +746,12 @@ protected:
             double normalized = state->scaleSpeed / 1000.0;  // -1 to 1
             double curved = normalized * normalized * normalized;  // cubic: preserves sign
             double scaleMultiplier = pow(3.0, curved / 60.0);  // 3x per second at max
-            state->scale *= scaleMultiplier;
+            state->scale.mul_inplace(scaleMultiplier);
             changed = true;
         }
 
         if (changed) {
-            sidebar->updateInfo(state->posX, state->posY, state->scale);
+            sidebar->updateInfo(state->posX.toDouble(), state->posY.toDouble(), state->scale.toDouble());
         }
 
         // Render if something changed or there are unrendered chunks
@@ -725,11 +820,11 @@ protected:
     {
         // Scroll up = zoom in (double), scroll down = zoom out (half)
         if (event->angleDelta().y() > 0) {
-            state->scale *= 2.0;
+            state->scale.mul_inplace(2.0);
         } else if (event->angleDelta().y() < 0) {
-            state->scale *= 0.5;
+            state->scale.mul_inplace(0.5);
         }
-        sidebar->updateInfo(state->posX, state->posY, state->scale);
+        sidebar->updateInfo(state->posX.toDouble(), state->posY.toDouble(), state->scale.toDouble());
         fractalWidget->renderFractal();
     }
 
