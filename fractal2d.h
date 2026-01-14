@@ -116,11 +116,13 @@ inline std::pair<std::vector<ComplexD>, int> computeReferenceOrbit(
 }
 
 // Perturbation iteration for a single pixel
+// pixelC is the actual C value for this pixel (computed with high precision outside)
 // Returns iteration count where it escapes, or -1 if doesn't escape
 inline int perturbationIterate(
     const std::vector<ComplexD>& refOrbit,
     int refEscapeIter,
     ComplexD deltaC,
+    ComplexD pixelC,  // For fallback when reference escapes
     int maxIter,
     bool& glitched)
 {
@@ -129,8 +131,9 @@ inline int perturbationIterate(
 
     int orbitLen = (int)refOrbit.size();
     int limit = (refEscapeIter >= 0) ? std::min(refEscapeIter, maxIter) : maxIter;
+    limit = std::min(limit, orbitLen);
 
-    for (int i = 0; i < limit && i < orbitLen; ++i)
+    for (int i = 0; i < limit; ++i)
     {
         ComplexD Z = refOrbit[i];
 
@@ -143,11 +146,11 @@ inline int perturbationIterate(
             return i;
         }
 
-        // Glitch detection: if |delta| > |Z| * 1e6, reference is not useful
-        // This happens when delta dominates and we lose precision
+        // Glitch detection: if |delta| becomes too large relative to Z
+        // This means the reference point is too far and we need a closer one
         double Znorm = std::norm(Z);
         double deltaNorm = std::norm(delta);
-        if (Znorm > 1e-20 && deltaNorm > Znorm * 1e12)
+        if (Znorm > 1e-30 && deltaNorm > Znorm * 1e6)
         {
             glitched = true;
             return i;
@@ -158,9 +161,9 @@ inline int perturbationIterate(
     }
 
     // If reference escaped but we didn't, continue with direct iteration
+    // using the pixel's actual C value (loses precision at extreme zooms)
     if (refEscapeIter >= 0 && refEscapeIter < maxIter)
     {
-        // Use the last W value and continue iterating directly
         ComplexD W = refOrbit.back() + delta;
         for (int i = refEscapeIter; i < maxIter; ++i)
         {
@@ -168,8 +171,7 @@ inline int perturbationIterate(
             {
                 return i;
             }
-            W = W * W + ComplexD(refOrbit[0].real(), refOrbit[0].imag()) + deltaC;
-            // Note: this loses precision at deep zooms, but handles edge cases
+            W = W * W + pixelC;
         }
     }
 
@@ -303,9 +305,24 @@ public:
                         chunk.processing = true;
                         activeThreads++;
                         int gen = generation;
+                        mpfr_prec_t precision = state->getRequiredPrecision();
 
-                        std::thread([this, cx, cy, scale, w, maxIter, hueStart, hueRange, gen]() {
-                            renderChunk(cx, cy, scale, w, maxIter, hueStart, hueRange, gen);
+                        // Compute chunk origin in high precision
+                        MPFRFloat chunkOriginX(precision);
+                        MPFRFloat chunkOriginY(precision);
+                        chunkOriginX.set(state->posX);
+                        chunkOriginY.set(state->posY);
+                        // Offset from camera to chunk origin
+                        double offsetX = chunkWorldLeft - posX;
+                        double offsetY = chunkWorldBottom - posY;
+                        chunkOriginX.add_inplace(offsetX);
+                        chunkOriginY.add_inplace(offsetY);
+
+                        std::thread([this, cx, cy, chunkOriginX = std::move(chunkOriginX),
+                                     chunkOriginY = std::move(chunkOriginY), pixelSize, maxIter,
+                                     hueStart, hueRange, precision, gen]() mutable {
+                            renderChunk(cx, cy, chunkOriginX, chunkOriginY, pixelSize, maxIter,
+                                       hueStart, hueRange, precision, gen);
                             activeThreads--;
                         }).detach();
                     }
@@ -332,56 +349,143 @@ private:
         chunks.clear();
     }
 
-    // Calculate Mandelbrot color for world position (static for thread safety)
-    static uint32_t calcMandelbrot(double cx, double cy, int maxIterations, int hueStart, int hueRange)
-    {
-        double zx = 0.0;
-        double zy = 0.0;
-        int iterations = 0;
-
-        while (iterations < maxIterations)
-        {
-            double zx2 = zx * zx;
-            double zy2 = zy * zy;
-
-            if (zx2 + zy2 > 4.0) break;
-
-            double newZx = zx2 - zy2 + cx;
-            zy = 2.0 * zx * zy + cy;
-            zx = newZx;
-
-            iterations++;
-        }
-
-        if (iterations == maxIterations)
-        {
-            return 0x000000;
-        }
-
-        int hue = (hueStart + iterations * hueRange / maxIterations) % 360;
-        return hsvToRgb(hue);
-    }
-
-    // Render entire chunk (all 100x100 pixels)
-    void renderChunk(int chunkX, int chunkY, double scale, int screenWidth, int maxIter, int hueStart, int hueRange, int gen)
+    // Render entire chunk using perturbation theory
+    void renderChunk(int chunkX, int chunkY, const MPFRFloat& centerX, const MPFRFloat& centerY,
+                     double pixelSize, int maxIter, int hueStart, int hueRange,
+                     mpfr_prec_t precision, int gen)
     {
         // Render to local buffer first
         uint32_t localData[CHUNK_SIZE * CHUNK_SIZE];
+        int localIterations[CHUNK_SIZE * CHUNK_SIZE];
+        bool needsRecompute[CHUNK_SIZE * CHUNK_SIZE];
 
-        double pixelSize = 2.0 / (scale * screenWidth);
-        double chunkWorldSize = CHUNK_SIZE * pixelSize;
+        // Compute chunk center in world coordinates (high precision)
+        MPFRFloat chunkCenterX(precision);
+        MPFRFloat chunkCenterY(precision);
+        double halfChunk = (CHUNK_SIZE - 1) / 2.0 * pixelSize;
+        chunkCenterX.set(centerX);
+        chunkCenterX.add_inplace(halfChunk);
+        chunkCenterY.set(centerY);
+        chunkCenterY.add_inplace(halfChunk);
 
-        double chunkOriginX = chunkX * chunkWorldSize;
-        double chunkOriginY = chunkY * chunkWorldSize;
+        // Compute reference orbit at chunk center
+        auto [refOrbit, refEscapeIter] = computeReferenceOrbit(chunkCenterX, chunkCenterY, maxIter, precision);
 
+        // Store reference orbits for potential glitch recovery
+        std::vector<std::vector<ComplexD>> refOrbits = {refOrbit};
+        std::vector<int> refEscapeIters = {refEscapeIter};
+        std::vector<std::pair<double, double>> refOffsets = {{halfChunk, halfChunk}};  // offset from chunk origin
+
+        // Chunk origin as double for computing pixel C values
+        double originX = centerX.toDouble();
+        double originY = centerY.toDouble();
+
+        // First pass: render all pixels using primary reference
+        int glitchCount = 0;
         for (int ly = 0; ly < CHUNK_SIZE; ++ly)
         {
-            double cy = chunkOriginY + ly * pixelSize;
-            uint32_t *row = localData + ly * CHUNK_SIZE;
             for (int lx = 0; lx < CHUNK_SIZE; ++lx)
             {
-                double cx = chunkOriginX + lx * pixelSize;
-                row[lx] = calcMandelbrot(cx, cy, maxIter, hueStart, hueRange);
+                int idx = ly * CHUNK_SIZE + lx;
+
+                // Delta from reference point (chunk center)
+                double deltaReal = (lx - (CHUNK_SIZE - 1) / 2.0) * pixelSize;
+                double deltaImag = (ly - (CHUNK_SIZE - 1) / 2.0) * pixelSize;
+                ComplexD deltaC(deltaReal, deltaImag);
+
+                // Pixel's actual C value (for fallback iteration)
+                ComplexD pixelC(originX + lx * pixelSize, originY + ly * pixelSize);
+
+                bool glitched = false;
+                int iter = perturbationIterate(refOrbit, refEscapeIter, deltaC, pixelC, maxIter, glitched);
+
+                localIterations[idx] = iter;
+                needsRecompute[idx] = glitched;
+                if (glitched) glitchCount++;
+            }
+        }
+
+        // Handle glitched pixels by computing additional reference points
+        while (glitchCount > 0)
+        {
+            // Find a glitched pixel to use as new reference
+            int newRefLx = -1, newRefLy = -1;
+            for (int ly = 0; ly < CHUNK_SIZE && newRefLx < 0; ++ly)
+            {
+                for (int lx = 0; lx < CHUNK_SIZE; ++lx)
+                {
+                    if (needsRecompute[ly * CHUNK_SIZE + lx])
+                    {
+                        newRefLx = lx;
+                        newRefLy = ly;
+                        break;
+                    }
+                }
+            }
+
+            if (newRefLx < 0) break;
+
+            // Compute new reference orbit at this pixel
+            MPFRFloat newRefX(precision);
+            MPFRFloat newRefY(precision);
+            newRefX.set(centerX);
+            newRefX.add_inplace(newRefLx * pixelSize);
+            newRefY.set(centerY);
+            newRefY.add_inplace(newRefLy * pixelSize);
+
+            auto [newOrbit, newEscapeIter] = computeReferenceOrbit(newRefX, newRefY, maxIter, precision);
+
+            refOrbits.push_back(newOrbit);
+            refEscapeIters.push_back(newEscapeIter);
+            refOffsets.push_back({newRefLx * pixelSize, newRefLy * pixelSize});
+
+            // Re-render glitched pixels using new reference
+            int fixedCount = 0;
+            for (int ly = 0; ly < CHUNK_SIZE; ++ly)
+            {
+                for (int lx = 0; lx < CHUNK_SIZE; ++lx)
+                {
+                    int idx = ly * CHUNK_SIZE + lx;
+                    if (!needsRecompute[idx]) continue;
+
+                    // Delta from new reference point
+                    double deltaReal = (lx * pixelSize) - refOffsets.back().first;
+                    double deltaImag = (ly * pixelSize) - refOffsets.back().second;
+                    ComplexD deltaC(deltaReal, deltaImag);
+
+                    // Pixel's actual C value
+                    ComplexD pixelC(originX + lx * pixelSize, originY + ly * pixelSize);
+
+                    bool glitched = false;
+                    int iter = perturbationIterate(newOrbit, newEscapeIter, deltaC, pixelC, maxIter, glitched);
+
+                    if (!glitched)
+                    {
+                        localIterations[idx] = iter;
+                        needsRecompute[idx] = false;
+                        fixedCount++;
+                    }
+                }
+            }
+
+            glitchCount -= fixedCount;
+
+            // Safety: prevent infinite loop if we can't fix glitches
+            if (fixedCount == 0) break;
+        }
+
+        // Convert iterations to colors
+        for (int i = 0; i < CHUNK_SIZE * CHUNK_SIZE; ++i)
+        {
+            int iter = localIterations[i];
+            if (iter < 0)
+            {
+                localData[i] = 0x000000;  // In set
+            }
+            else
+            {
+                int hue = (hueStart + iter * hueRange / maxIter) % 360;
+                localData[i] = hsvToRgb(hue);
             }
         }
 
@@ -391,6 +495,8 @@ private:
             auto key = std::make_pair(chunkX, chunkY);
             Chunk &chunk = chunks[key];
             memcpy(chunk.data, localData, sizeof(localData));
+            chunk.referenceOrbits = std::move(refOrbits);
+            chunk.referenceEscapeIter = std::move(refEscapeIters);
             chunk.rendered = true;
             chunk.processing = false;
         }
